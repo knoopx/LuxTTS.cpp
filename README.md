@@ -32,6 +32,11 @@ Options (CPU-only by design — there are no GPU options):
 
 ## Getting the model (one-time, CPU-only)
 
+Pre-converted GGUF weights are available at
+[knoopx/LuxTTS-GGUF](https://huggingface.co/knoopx/LuxTTS-GGUF) — download
+`luxtts-f32.gguf` (or `luxtts-q8_0.gguf`) and skip the conversion step
+below (the tokenizer vocab is embedded in the GGUF).
+
 The GGUF is produced from the upstream torch artifacts
 ([YatharthS/LuxTTS](https://huggingface.co/YatharthS/LuxTTS)) by a tool —
 the equivalent of magpie-tts.cpp's conversion step:
@@ -60,7 +65,8 @@ models/luxtts/
 
 Place the HF repo files (`model.pt`, `vocoder/vocos.bin`, `tokens.txt`,
 `config.json`) in this directory for the conversion step; at *runtime* the
-CLI only needs `luxtts-*.gguf` + `tokens.txt`.
+CLI only needs `luxtts-*.gguf` (the tokenizer vocab is embedded in the
+GGUF as the `luxtts.tokens` metadata).
 
 ## Usage
 
