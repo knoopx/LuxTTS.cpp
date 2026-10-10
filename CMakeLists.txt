@@ -27,14 +27,19 @@ option(LUX_NATIVE      "Compile with -march=native"         ON)
 option(LUX_BUILD_CLI   "Build the luxtts CLI"                ON)
 
 # ---------------------------------------------------------------------------
-# Third-party — fetched at configure time (see third_party/README.md)
+# Third-party — either fetched at configure time (see third_party/README.md)
+# or host-provided: -DLUX_SYSTEM_DEPS=ON (flake.nix) links nixpkgs ggml +
+# kissfft outputs instead of FetchContent (hermetic, no network at build time).
 # ---------------------------------------------------------------------------
-include(FetchContent)
+option(LUX_SYSTEM_DEPS
+       "Link host-provided ggml + kissfft (find_package / imported target) instead of FetchContent (used by flake.nix)" OFF)
 
 # The GGUF keeps torch state-dict tensor names verbatim; the longest
 # (~73 chars) exceeds ggml's default GGML_MAX_NAME=64. It sizes
 # ggml_tensor::name, so it must be identical in ggml and in every consumer TU —
-# hence a directory-scope definition ahead of the ggml FetchContent.
+# hence a directory-scope definition ahead of the ggml FetchContent. In
+# LUX_SYSTEM_DEPS mode flake.nix builds the nix ggml with the same
+# -DGGML_MAX_NAME=128 (see flake.nix's ggml overrideAttrs).
 add_compile_definitions(GGML_MAX_NAME=128)
 
 # Keep ggml (and everything else) static so the libluxtts static target embeds
@@ -42,48 +47,98 @@ add_compile_definitions(GGML_MAX_NAME=128)
 # -DBUILD_SHARED_LIBS=ON on the command line.
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries (ggml is linked statically into luxtts by default)")
 
-# ggml: the CPU tensor engine. CPU-only build; every accelerator backend is OFF.
-set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GGML_NATIVE         ${LUX_NATIVE} CACHE BOOL "" FORCE)
-set(GGML_OPENMP         ON  CACHE BOOL "" FORCE)   # CPU threading for the graph compute
-set(GGML_BLAS           OFF CACHE BOOL "" FORCE)   # no external BLAS; pure CPU
-# GPU / accelerator backends — all OFF (hard constraint: CPU-only).
-set(GGML_CUDA    OFF CACHE BOOL "" FORCE)
-set(GGML_VULKAN  OFF CACHE BOOL "" FORCE)
-set(GGML_METAL   OFF CACHE BOOL "" FORCE)
-set(GGML_HIP     OFF CACHE BOOL "" FORCE)
-set(GGML_SYCL    OFF CACHE BOOL "" FORCE)
-set(GGML_OPENCL  OFF CACHE BOOL "" FORCE)
-set(GGML_WEBGPU  OFF CACHE BOOL "" FORCE)
-set(GGML_VIRTGPU OFF CACHE BOOL "" FORCE)
-set(GGML_ZDNN    OFF CACHE BOOL "" FORCE)
-set(GGML_ZENDNN  OFF CACHE BOOL "" FORCE)
-set(GGML_HEXAGON OFF CACHE BOOL "" FORCE)
-set(GGML_ET      OFF CACHE BOOL "" FORCE)
-set(GGML_OPENVINO OFF CACHE BOOL "" FORCE)
-# PIN: pin to a known-good ggml commit for reproducible builds.
-# v0.24.0 — commit 456172ec (2026-09; "ggml: bump version to 0.24.0").
-FetchContent_Declare(
-  ggml
-  GIT_REPOSITORY https://github.com/ggml-org/ggml
-  GIT_TAG        456172ec733a135778adcd32d00e576a58232e45
-)
-FetchContent_MakeAvailable(ggml)
+if(LUX_SYSTEM_DEPS)
+  # --- Host-provided deps (nixpkgs outputs, wired up by flake.nix) --------
+  # ggml: the nix prefix is on CMAKE_PREFIX_PATH; its ggml-config.cmake
+  # (lib/cmake/ggml/) provides the namespaced imported targets, incl.
+  # ggml::ggml-base and ggml::ggml-cpu (the CPU-only backend set the nix
+  # package builds).
+  find_package(ggml REQUIRED)
+  set(LUX_GGML_TARGETS ggml::ggml-base ggml::ggml-cpu)
 
-# kissfft: 1024-pt real FFT for the Linkwitz-Riley crossover in the vocoder.
-# Pinned to a known-good commit (kissfft 131.2.0, commit 7bce4153; the tag is
-# `131.2.0` without a v-prefix). Static float build; tests/tools/pkg-config disabled.
-set(KISSFFT_STATIC   ON  CACHE BOOL "" FORCE)
-set(KISSFFT_TEST     OFF CACHE BOOL "" FORCE)
-set(KISSFFT_TOOLS    OFF CACHE BOOL "" FORCE)
-set(KISSFFT_PKGCONFIG OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-  kissfft
-  GIT_REPOSITORY https://github.com/mborgerding/kissfft
-  GIT_TAG        7bce4153c6bc8aba2db0e889e576f9d00505cbe1
-)
-FetchContent_MakeAvailable(kissfft)
+  # kissfft: the existing link lines expect a target named `kissfft`, so create
+  # an IMPORTED STATIC one from the nixpkgs kissfft-float (static) outputs:
+  #   out: lib/libkissfft-float.a
+  #   dev: include/kissfft/*.h  (headers are namespaced under kissfft/)
+  # LUX_KISSFFT_ROOT is a ';'-separated list of those outputs (the flake
+  # passes both); the lib and the headers are located inside it.
+  set(LUX_KISSFFT_ROOT "" CACHE STRING
+      "kissfft-float (static) nix output(s), ';'-separated; required with LUX_SYSTEM_DEPS=ON")
+  if(NOT LUX_KISSFFT_ROOT)
+    message(FATAL_ERROR "LUX_SYSTEM_DEPS=ON requires -DLUX_KISSFFT_ROOT=<out>;<dev> (nixpkgs kissfft-float static outputs)")
+  endif()
+  set(_lux_kiss_lib_paths)
+  set(_lux_kiss_inc_dirs)
+  foreach(_lux_r IN LISTS LUX_KISSFFT_ROOT)
+    list(APPEND _lux_kiss_lib_paths "${_lux_r}" "${_lux_r}/lib")
+    if(IS_DIRECTORY "${_lux_r}/include/kissfft")
+      list(APPEND _lux_kiss_inc_dirs "${_lux_r}/include/kissfft")
+    endif()
+  endforeach()
+  find_library(LUX_KISSFFT_LIB NAMES kissfft-float
+    HINTS ${_lux_kiss_lib_paths} NO_DEFAULT_PATH)
+  if(NOT LUX_KISSFFT_LIB)
+    message(FATAL_ERROR "kissfft-float static lib not found in LUX_KISSFFT_ROOT=${LUX_KISSFFT_ROOT}")
+  endif()
+  if(NOT _lux_kiss_inc_dirs)
+    message(FATAL_ERROR "kissfft headers (include/kissfft/) not found in LUX_KISSFFT_ROOT=${LUX_KISSFFT_ROOT}")
+  endif()
+  add_library(kissfft STATIC IMPORTED GLOBAL)
+  set_target_properties(kissfft PROPERTIES
+    IMPORTED_LOCATION "${LUX_KISSFFT_LIB}"
+    INTERFACE_INCLUDE_DIRECTORIES "${_lux_kiss_inc_dirs}"
+    # nixpkgs builds the float variant: scalar type must match the lib.
+    INTERFACE_COMPILE_DEFINITIONS "kiss_fft_scalar=float"
+    INTERFACE_LINK_LIBRARIES "m")
+else()
+  # --- Host build: fetch pinned ggml + kissfft at configure time -----------
+  include(FetchContent)
+
+  # ggml: the CPU tensor engine. CPU-only build; every accelerator backend is OFF.
+  set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+  set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(GGML_NATIVE         ${LUX_NATIVE} CACHE BOOL "" FORCE)
+  set(GGML_OPENMP         ON  CACHE BOOL "" FORCE)   # CPU threading for the graph compute
+  set(GGML_BLAS           OFF CACHE BOOL "" FORCE)   # no external BLAS; pure CPU
+  # GPU / accelerator backends — all OFF (hard constraint: CPU-only).
+  set(GGML_CUDA    OFF CACHE BOOL "" FORCE)
+  set(GGML_VULKAN  OFF CACHE BOOL "" FORCE)
+  set(GGML_METAL   OFF CACHE BOOL "" FORCE)
+  set(GGML_HIP     OFF CACHE BOOL "" FORCE)
+  set(GGML_SYCL    OFF CACHE BOOL "" FORCE)
+  set(GGML_OPENCL  OFF CACHE BOOL "" FORCE)
+  set(GGML_WEBGPU  OFF CACHE BOOL "" FORCE)
+  set(GGML_VIRTGPU OFF CACHE BOOL "" FORCE)
+  set(GGML_ZDNN    OFF CACHE BOOL "" FORCE)
+  set(GGML_ZENDNN  OFF CACHE BOOL "" FORCE)
+  set(GGML_HEXAGON OFF CACHE BOOL "" FORCE)
+  set(GGML_ET      OFF CACHE BOOL "" FORCE)
+  set(GGML_OPENVINO OFF CACHE BOOL "" FORCE)
+  # PIN: pin to a known-good ggml commit for reproducible builds.
+  # v0.24.0 — commit 456172ec (2026-09; "ggml: bump version to 0.24.0").
+  FetchContent_Declare(
+    ggml
+    GIT_REPOSITORY https://github.com/ggml-org/ggml
+    GIT_TAG        456172ec733a135778adcd32d00e576a58232e45
+  )
+  FetchContent_MakeAvailable(ggml)
+
+  # kissfft: 1024-pt real FFT for the Linkwitz-Riley crossover in the vocoder.
+  # Pinned to a known-good commit (kissfft 131.2.0, commit 7bce4153; the tag is
+  # `131.2.0` without a v-prefix). Static float build; tests/tools/pkg-config disabled.
+  set(KISSFFT_STATIC   ON  CACHE BOOL "" FORCE)
+  set(KISSFFT_TEST     OFF CACHE BOOL "" FORCE)
+  set(KISSFFT_TOOLS    OFF CACHE BOOL "" FORCE)
+  set(KISSFFT_PKGCONFIG OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    kissfft
+    GIT_REPOSITORY https://github.com/mborgerding/kissfft
+    GIT_TAG        7bce4153c6bc8aba2db0e889e576f9d00505cbe1
+  )
+  FetchContent_MakeAvailable(kissfft)
+
+  set(LUX_GGML_TARGETS ggml-base ggml-cpu)
+endif()
 
 # ---------------------------------------------------------------------------
 # Core library
@@ -109,8 +164,9 @@ endif()
 target_include_directories(luxtts PUBLIC include)
 target_include_directories(luxtts PRIVATE src third_party)
 
-# ggml CPU engine + kissfft (real FFT). Link the base + cpu targets (magpie pattern).
-target_link_libraries(luxtts PUBLIC ggml-base ggml-cpu)
+# ggml CPU engine + kissfft (real FFT). Link the base + cpu targets (magpie
+# pattern); the target set depends on the dep mode (in-tree vs nix imported).
+target_link_libraries(luxtts PUBLIC ${LUX_GGML_TARGETS})
 target_link_libraries(luxtts PRIVATE kissfft)
 
 target_compile_options(luxtts PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
